@@ -77,9 +77,9 @@ def process_alerts():
                     )
                     print(f"SMS delivered. Twilio SID: {msg.sid}")
 
-                    # Mark status as notified so we don't duplicate
+                    # Mark status as completed so we don't duplicate
                     supabase.table("cancellation_alerts").update({
-                        "status": "notified"
+                        "status": "completed"
                     }).eq("id", alert_id).execute()
 
                 except Exception as sms_err:
