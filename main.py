@@ -27,41 +27,48 @@ def normalize_phone(phone: str) -> str:
         return f"+{digits}"
     return phone if phone.startswith("+") else f"+{digits}"
 
-def check_campsite_availability(park: str, start_date: str, end_date: str) -> bool:
+def check_campsite_availability(park_id_or_name: str, start_date: str, end_date: str) -> bool:
     """
-    Uses ZenRows to scrape the target site without getting blocked, 
-    then parses the HTML to look for availability.
+    Uses ZenRows to scrape Parks Canada (GoingToCamp), 
+    then parses the HTML to look for active 'Reserve' buttons.
     """
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Scraping availability for {park} from {start_date} to {end_date}...")
+    # Quick dictionary to convert your text names from Supabase into Parks Canada Map IDs.
+    # Note: You will need to look up the exact Map IDs for the parks you want and update these numbers!
+    park_map_dictionary = {
+        "Tunnel Mountain Village 1": "-2147483634", 
+        "Two Jack Lakeside": "-2147483567",         # Placeholder ID - replace with the real one
+    }
     
-    # 1. Build the exact URL for the park you want to check.
-    # Note: Adjust this URL structure to match Parks Canada or Alberta Parks search formats
-    target_url = f"https://reservation.pc.gc.ca/search?park={park}&start={start_date}&end={end_date}"
+    # If the user typed a name, convert it to an ID. Otherwise, assume they typed an ID directly.
+    park_map_id = park_map_dictionary.get(park_id_or_name, park_id_or_name)
+
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Scraping availability for {park_id_or_name} (Map ID: {park_map_id}) from {start_date} to {end_date}...")
     
-    # 2. Route the request through ZenRows with premium proxy and JS rendering enabled
+    # 1. The exact Parks Canada URL structure
+    target_url = f"https://reservation.pc.gc.ca/create-booking/results?mapId={park_map_id}&searchTabGroupId=0&bookingCategoryId=0&startDate={start_date}&endDate={end_date}"
+    
+    # 2. Route the request through ZenRows
     proxy_url = "https://api.zenrows.com/v1/"
     params = {
         "apikey": ZENROWS_API_KEY,
         "url": target_url,
         "js_render": "true",
         "premium_proxy": "true",
+        "wait_for": ".mat-button-wrapper" # Tells ZenRows to wait for the page elements to load
     }
 
     try:
         response = requests.get(proxy_url, params=params)
-        
-        # 3. Read the HTML returned by ZenRows
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 4. Check for availability keywords or buttons.
-        # Note: You will need to inspect the target website to find the exact HTML class name they use.
-        available_campsites = soup.find_all(class_='available-site-button-class') 
+        # 3. Look for active 'Reserve' or 'Add to Cart' buttons in the HTML
+        available_sites = soup.find_all(lambda tag: tag.name == 'button' and tag.text and 'Reserve' in tag.text)
         
-        if len(available_campsites) > 0:
+        if len(available_sites) > 0:
             return True
             
     except Exception as e:
-        print(f"Error scraping {park}: {e}")
+        print(f"Error scraping {park_id_or_name}: {e}")
 
     return False
 
@@ -84,7 +91,7 @@ def process_alerts():
             end = alert.get("end_date")
             raw_contact = alert.get("user_contact")
 
-            if not raw_contact:
+            if not raw_contact or not park:
                 continue
 
             phone = normalize_phone(raw_contact)
