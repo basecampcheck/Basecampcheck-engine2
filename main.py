@@ -32,36 +32,37 @@ def check_campsite_availability(park_id_or_name: str, start_date: str, end_date:
     Uses ZenRows to scrape Parks Canada (GoingToCamp), 
     then parses the HTML to look for active 'Reserve' buttons.
     """
-    # Quick dictionary to convert your text names from Supabase into Parks Canada Map IDs.
-    # Note: You will need to look up the exact Map IDs for the parks you want and update these numbers!
+    # Dictionary converting user-facing park names into precise Parks Canada Map IDs
     park_map_dictionary = {
         "Tunnel Mountain Village 1": "-2147483634", 
-        "Two Jack Lakeside": "-2147483567",         # Placeholder ID - replace with the real one
+        "Tunnel Mountain Village I": "-2147483634", # Added to support Roman numeral formatting (I vs 1)
+        "Two Jack Lakeside": "-2147483567",         # Placeholder ID - update if required
     }
     
-    # If the user typed a name, convert it to an ID. Otherwise, assume they typed an ID directly.
+    # If a matched name is found in the dictionary, resolve it to its correct map ID. 
+    # If a user types the ID directly, use that string. Otherwise, gracefully fall back.
     park_map_id = park_map_dictionary.get(park_id_or_name, park_id_or_name)
 
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Scraping availability for {park_id_or_name} (Map ID: {park_map_id}) from {start_date} to {end_date}...")
     
-    # 1. The exact Parks Canada URL structure
+    # 1. The exact Parks Canada / GoingToCamp URL structure
     target_url = f"https://reservation.pc.gc.ca/create-booking/results?mapId={park_map_id}&searchTabGroupId=0&bookingCategoryId=0&startDate={start_date}&endDate={end_date}"
     
-    # 2. Route the request through ZenRows
+    # 2. Route the request through ZenRows with JS and Premium proxy configurations
     proxy_url = "https://api.zenrows.com/v1/"
     params = {
         "apikey": ZENROWS_API_KEY,
         "url": target_url,
         "js_render": "true",
         "premium_proxy": "true",
-        "wait_for": ".mat-button-wrapper" # Tells ZenRows to wait for the page elements to load
+        "wait_for": ".mat-button-wrapper" # Ensure Angular/React components have rendered
     }
 
     try:
         response = requests.get(proxy_url, params=params)
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 3. Look for active 'Reserve' or 'Add to Cart' buttons in the HTML
+        # 3. Assess if a reserve option is visible on the page
         available_sites = soup.find_all(lambda tag: tag.name == 'button' and tag.text and 'Reserve' in tag.text)
         
         if len(available_sites) > 0:
