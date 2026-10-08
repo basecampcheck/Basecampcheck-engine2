@@ -1,6 +1,8 @@
 import os
 import time
 from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
 from supabase import create_client, Client
 from twilio.rest import Client as TwilioClient
 
@@ -10,6 +12,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_FROM = os.environ.get("TWILIO_PHONE_NUMBER")
+ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY")
 
 # Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -26,13 +29,41 @@ def normalize_phone(phone: str) -> str:
 
 def check_campsite_availability(park: str, start_date: str, end_date: str) -> bool:
     """
-    Checks target booking APIs or portal status.
-    For end-to-end testing, this returns True if an alert has a target keyword,
-    or integrates directly with provincial availability feeds.
+    Uses ZenRows to scrape the target site without getting blocked, 
+    then parses the HTML to look for availability.
     """
-    # Replace/extend with specific provider scraping endpoints (Parks Canada, Alberta Parks, etc.)
-    # Returning True triggers notification verification for end-to-end testing
-    return True
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Scraping availability for {park} from {start_date} to {end_date}...")
+    
+    # 1. Build the exact URL for the park you want to check.
+    # Note: Adjust this URL structure to match Parks Canada or Alberta Parks search formats
+    target_url = f"https://reservation.pc.gc.ca/search?park={park}&start={start_date}&end={end_date}"
+    
+    # 2. Route the request through ZenRows with premium proxy and JS rendering enabled
+    proxy_url = "https://api.zenrows.com/v1/"
+    params = {
+        "apikey": ZENROWS_API_KEY,
+        "url": target_url,
+        "js_render": "true",
+        "premium_proxy": "true",
+    }
+
+    try:
+        response = requests.get(proxy_url, params=params)
+        
+        # 3. Read the HTML returned by ZenRows
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 4. Check for availability keywords or buttons.
+        # Note: You will need to inspect the target website to find the exact HTML class name they use.
+        available_campsites = soup.find_all(class_='available-site-button-class') 
+        
+        if len(available_campsites) > 0:
+            return True
+            
+    except Exception as e:
+        print(f"Error scraping {park}: {e}")
+
+    return False
 
 def process_alerts():
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checking pending alerts...")
