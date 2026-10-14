@@ -1,6 +1,6 @@
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 import requests
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
@@ -24,6 +24,21 @@ TIER_INTERVALS = {
     "priority": 180,     # 3 minutes
     "standard": 600,     # 10 minutes
     "free": 1800         # 30 minutes
+}
+
+# 11 Major Provider Networks Master Booking Horizons (in days)
+PROVIDER_HORIZONS = {
+    "bcparks": 90,           # 3 months max rolling window
+    "alberta_parks": 90,     # 3 months standard (180 for comfort camping)
+    "ontario_parks": 150,    # 5 months rolling window
+    "recreation_gov": 180,   # 6 months rolling window
+    "parks_canada": 180,     # 6 months rolling window
+    "maritimes": 120,        # ~4 months regional provincial cap
+    "sepaq": 365,            # Seasonal blocks up to 1 year
+    "campspot": 365,         # 12 months for private RV networks
+    "hipcamp": 365,          # 12 months for glamping
+    "koa": 365,              # 12 months for KOA network
+    "rms_cloud": 365         # 12 months for luxury golf/RV resorts
 }
 
 # In-memory timestamp tracker: { alert_id: last_scanned_unix_timestamp }
@@ -54,10 +69,26 @@ def get_user_tier(contact: str) -> str:
         print(f"Error fetching tier for {contact}: {err}")
     return "free"
 
-def check_campsite_availability(park_id_or_name: str, start_date: str, end_date: str) -> bool:
-    """Uses ZenRows to scrape Parks Canada (GoingToCamp) and checks for active 'Reserve' buttons."""
+def is_date_within_provider_horizon(provider_network: str, target_date_str: str) -> bool:
+    """Validates if a target booking date falls within the network's legal horizon."""
+    try:
+        target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+        max_days = PROVIDER_HORIZONS.get(provider_network, 90)
+        max_allowed_date = date.today() + timedelta(days=max_days)
+        return target_date <= max_allowed_date
+    except Exception as e:
+        print(f"Error parsing date {target_date_str}: {e}")
+        return True # Default to allow if format parsing fails
+
+def check_campsite_availability(park_id_or_name: str, start_date: str, end_date: str, provider_network: str = "parks_canada") -> bool:
+    """Validates booking horizon and uses ZenRows to scrape inventory."""
+    # Enforce provider horizon rule before spending proxy credits
+    if not is_date_within_provider_horizon(provider_network, start_date):
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Skipping scan for {park_id_or_name}: Start date {start_date} exceeds {provider_network} booking horizon.")
+        return False
+
     park_map_dictionary = {
-        "Tunnel Mountain Village 1": "-2147483634", 
+        "Tunnel Mountain Village 1": "-2147483634",  
         "Tunnel Mountain Village I": "-2147483634",
         "Two Jack Lakeside": "-2147483567",
     }
@@ -118,6 +149,7 @@ def process_alerts():
             park = alert.get("specific_site") or alert.get("park_name")
             start = alert.get("start_date")
             end = alert.get("end_date")
+            provider = alert.get("provider_network", "parks_canada")
 
             if not raw_contact or not park:
                 continue
@@ -139,8 +171,8 @@ def process_alerts():
 
             phone = normalize_phone(raw_contact)
             
-            # Run availability check
-            is_open = check_campsite_availability(park, start, end)
+            # Run availability check with horizon validation
+            is_open = check_campsite_availability(park, start, end, provider)
 
             if is_open:
                 print(f"Opening found for {park}! Sending SMS to {phone}...")
@@ -172,7 +204,7 @@ def process_alerts():
         print(f"Error querying Supabase: {e}")
 
 def main():
-    print("BasecampCheck Tiered Scraper Engine Online.")
+    print("BasecampCheck Tiered Scraper Engine & Booking Horizon Controller Online.")
     while True:
         process_alerts()
         # Loop evaluates the queue every 60 seconds to process Instant scans on time
