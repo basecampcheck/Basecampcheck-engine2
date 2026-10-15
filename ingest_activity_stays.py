@@ -111,4 +111,4 @@ ACTIVITY_STAYS = [
     },
     {
         "name": "Likely Place Golf & RV Resort",
-        "provider_network
+        "provider_network": "independent",
