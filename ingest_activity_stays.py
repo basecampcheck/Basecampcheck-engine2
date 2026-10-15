@@ -111,12 +111,4 @@ ACTIVITY_STAYS = [
     },
     {
         "name": "Likely Place Golf & RV Resort",
-        "provider_network": "independent",
-        "external_facility_id": "likely-place-ca",
-        "state_province": "CA",
-        "country": "US",
-        "latitude": 41.2299,
-        "longitude": -120.5055,
-        "booking_url": "https://likelyplace.com/",
-        "golf_on_site": True,
-        "primary_activity":"
+        "provider_network
