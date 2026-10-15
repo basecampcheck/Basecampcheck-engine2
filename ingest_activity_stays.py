@@ -119,4 +119,4 @@ ACTIVITY_STAYS = [
         "longitude": -120.5055,
         "booking_url": "https://likelyplace.com/",
         "golf_on_site": True,
-        "primary_activity": "
+        "primary_activity":"
