@@ -20,7 +20,8 @@ def fetch_sitemap_urls(sitemap_url):
     params = {
         "apikey": ZENROWS_API_KEY,
         "url": sitemap_url,
-        "premium_proxy": "true" # Forces residential IPs to bypass Cloudflare
+        "js_render": "true",       # Solves Cloudflare JS/Turnstile challenges
+        "premium_proxy": "true"    # Uses residential IPs
     }
     
     urls = []
@@ -49,4 +50,81 @@ def fetch_sitemap_urls(sitemap_url):
         
     return urls
 
-# ... (Keep the rest of your extract_campspot_slugs, koa_slugs, etc. functions exactly the same below here)
+def extract_campspot_slugs(urls):
+    records = []
+    for url in urls:
+        if "/book/" in url:
+            slug = url.split("/book/")[-1].strip("/")
+            records.append({
+                "name": slug.replace("-", " ").title(),
+                "provider_network": "campspot",
+                "external_facility_id": slug,
+                "country": "US",
+                "booking_url": url
+            })
+    return records
+
+def extract_koa_slugs(urls):
+    records = []
+    for url in urls:
+        if "/campgrounds/" in url:
+            parts = url.split("/campgrounds/")
+            if len(parts) > 1 and parts[1].strip("/"):
+                slug = parts[1].strip("/")
+                records.append({
+                    "name": f"{slug.replace('-', ' ').title()} KOA",
+                    "provider_network": "koa",
+                    "external_facility_id": slug,
+                    "country": "US",
+                    "booking_url": url
+                })
+    return records
+
+def extract_letscamp_slugs(urls):
+    """Extracts independent Canadian parks from the Let's Camp network."""
+    records = []
+    for url in urls:
+        if "/camps/" in url:
+            slug = url.split("/camps/")[-1].strip("/")
+            if slug and "?" not in slug:
+                records.append({
+                    "name": slug.replace("-", " ").title(),
+                    "provider_network": "lets_camp",
+                    "external_facility_id": slug,
+                    "country": "CA",
+                    "booking_url": url
+                })
+    return records
+
+def ingest_master_list():
+    print("=== Starting North American Private Network Extraction ===")
+    
+    # 1. Campspot (Premier Private Resorts & Glamping)
+    campspot_urls = fetch_sitemap_urls("https://www.campspot.com/sitemap.xml")
+    campspot_records = extract_campspot_slugs(campspot_urls)
+    
+    # 2. KOA (Major Franchised RV Parks)
+    koa_urls = fetch_sitemap_urls("https://koa.com/sitemap.xml")
+    koa_records = extract_koa_slugs(koa_urls)
+    
+    # 3. Let's Camp (Canadian Independent & Municipal Parks)
+    letscamp_urls = fetch_sitemap_urls("https://letscamp.ca/sitemap.xml")
+    letscamp_records = extract_letscamp_slugs(letscamp_urls)
+    
+    all_records = campspot_records + koa_records + letscamp_records
+    print(f"\n[*] Extraction Complete: Found {len(all_records)} private locations.")
+    
+    batch_size = 1000
+    for i in range(0, len(all_records), batch_size):
+        batch = all_records[i:i + batch_size]
+        try:
+            supabase.table("campgrounds").upsert(
+                batch, 
+                on_conflict="provider_network,external_facility_id"
+            ).execute()
+            print(f"[+] Upserted batch of {len(batch)} resorts to Supabase.")
+        except Exception as e:
+            print(f"[!] Database insert error on batch {i}: {e}")
+
+if __name__ == "__main__":
+    ingest_master_list()
