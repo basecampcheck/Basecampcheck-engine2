@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from datetime import datetime, timezone, date, timedelta
 import requests
@@ -43,8 +44,24 @@ PROVIDER_HORIZONS = {
     "rms_cloud": 365
 }
 
-# Track when the 30-minute broad calendar sync last ran
+# Key Canadian campgrounds mapped to their real Parks Canada mapIds & short-codes
+CANADIAN_RADAR_TARGETS = [
+    {"name": "Tunnel Mountain Village I", "short_id": "ca-ab-banff-tunnel-1", "map_id": "-2147483634", "provider": "parks_canada"},
+    {"name": "Tunnel Mountain Village II", "short_id": "ca-ab-banff-tunnel", "map_id": "-2147483633", "provider": "parks_canada"},
+    {"name": "Two Jack Lakeside", "short_id": "ca-ab-banff-twojack", "map_id": "-2147483567", "provider": "parks_canada"},
+    {"name": "Lake Louise Tent", "short_id": "ca-ab-banff-louise", "map_id": "-2147483559", "provider": "parks_canada"},
+]
+
 last_radar_sync_time = 0
+
+
+def to_ca_slug(name: str) -> str:
+    """
+    Converts a display name like 'Tunnel Mountain Village II'
+    into the exact frontend key: 'ca-tunnel-mountain-village-ii'
+    """
+    clean = re.sub(r"[^a-z0-9]+", "-", str(name).lower()).strip("-")
+    return clean if clean.startswith("ca-") else f"ca-{clean}"
 
 
 def normalize_phone(phone: str) -> str:
@@ -107,7 +124,9 @@ def check_parks_canada_availability(park_id_or_name: str, start_date: str, end_d
     park_map_dictionary = {
         "Tunnel Mountain Village 1": "-2147483634",
         "Tunnel Mountain Village I": "-2147483634",
+        "Tunnel Mountain Village II": "-2147483633",
         "Two Jack Lakeside": "-2147483567",
+        "Lake Louise Tent": "-2147483559",
     }
     park_map_id = park_map_dictionary.get(park_id_or_name, park_id_or_name)
     target_url = (
@@ -222,6 +241,46 @@ def check_campsite_availability(provider: str, park: str, ext_id: str, start: st
         return check_parks_canada_availability(park, start, end)
 
 
+def record_availability_to_db(campground_name: str, short_id: str, target_date: str, is_open: bool):
+    """
+    Writes availability to `campground_availability` under BOTH the frontend's
+    expected `'ca-' + slug(name)` ID AND the short_id so the calendar always matches.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    status_str = "available" if is_open else "reserved"
+    slug_id = to_ca_slug(campground_name)
+
+    ids_to_write = {slug_id}
+    if short_id:
+        ids_to_write.add(short_id)
+
+    for cid in ids_to_write:
+        try:
+            existing = (
+                supabase.table("campground_availability")
+                .select("id")
+                .eq("campground_id", cid)
+                .eq("availability_date", target_date)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                supabase.table("campground_availability").update({
+                    "status": status_str,
+                    "timestamp_scraped": now_iso
+                }).eq("id", existing.data[0]["id"]).execute()
+            else:
+                supabase.table("campground_availability").insert({
+                    "campground_id": cid,
+                    "unit_id": f"{cid}-site-1",
+                    "availability_date": target_date,
+                    "status": status_str,
+                    "timestamp_scraped": now_iso
+                }).execute()
+        except Exception as e:
+            print(f"[!] DB write error for {cid} on {target_date}: {e}")
+
+
 # ----------------- LOOP 1: 1-MINUTE SHARED SNIPER SCANNER -----------------
 
 def run_sniper_loop():
@@ -259,18 +318,8 @@ def run_sniper_loop():
         for (provider, park, ext_id, start, end), matching_alerts in unique_targets.items():
             is_open, book_url = check_campsite_availability(provider, park, ext_id, start, end)
 
-            # Also write live check result straight to campground_availability with fresh timestamp_scraped
-            try:
-                camp_slug = ext_id if ext_id else park
-                supabase.table("campground_availability").upsert({
-                    "campground_id": camp_slug,
-                    "unit_id": f"{camp_slug}-standard",
-                    "availability_date": start,
-                    "status": "Available" if is_open else "Reserved",
-                    "timestamp_scraped": now.isoformat()
-                }).execute()
-            except Exception:
-                pass
+            # Record live result into campground_availability under both slug and ext_id
+            record_availability_to_db(park, ext_id, start, is_open)
 
             if is_open:
                 print(f"[+] DROP FOUND at {park} ({start} to {end})! Queuing notifications by tier...")
@@ -292,7 +341,7 @@ def run_sniper_loop():
                             "delay_minutes": delay_mins,
                             "provider_network": provider,
                             "external_facility_id": ext_id,
-                            "campground_id": ext_id or park,
+                            "campground_id": to_ca_slug(park),
                             "campground_name": park,
                             "site_number": "Available",
                             "check_in": start,
@@ -373,12 +422,12 @@ def process_notification_queue():
         print(f"[!] Error processing notification queue: {e}")
 
 
-# ----------------- LOOP 2: 30-MINUTE BROAD RADAR CALENDAR REFRESH -----------------
+# ----------------- LOOP 2: 30-MINUTE BROAD RADAR LIVE SCRAPER -----------------
 
 def run_broad_radar_sync():
     """
-    Runs every 30 minutes to update `campground_availability` with fresh `timestamp_scraped`
-    values so the Lovable calendar UI stays within its 48-hour freshness window.
+    Runs every 30 minutes: performs real live checks on flagship Canadian campgrounds
+    and writes results under `'ca-' + slug(name)` (e.g., `ca-tunnel-mountain-village-ii`).
     """
     global last_radar_sync_time
     current_time = time.time()
@@ -387,59 +436,31 @@ def run_broad_radar_sync():
 
     last_radar_sync_time = current_time
     now_iso = datetime.now(timezone.utc).isoformat()
-    print(f"\n[{now_iso}] 📡 Running 30-Min Broad Radar Sync on `campground_availability`...")
+    print(f"\n[{now_iso}] 📡 Running 30-Min Broad Radar Live Scrape...")
 
-    try:
-        # 1. Refresh `timestamp_scraped` on existing rows in `campground_availability`
-        # so the calendar immediately passes the 48-hour `AVAILABILITY_FRESH_MS` check
-        supabase.table("campground_availability").update({
-            "timestamp_scraped": now_iso
-        }).gte("availability_date", date.today().isoformat()).execute()
-        print("[+] Refreshed `timestamp_scraped` for upcoming dates in `campground_availability`.")
+    today = date.today()
+    for target in CANADIAN_RADAR_TARGETS:
+        name = target["name"]
+        short_id = target["short_id"]
+        map_id = target["map_id"]
 
-        # 2. Fetch Canadian campgrounds from the `campgrounds` directory to ensure valid IDs
-        camps_res = supabase.table("campgrounds").select("*").limit(100).execute()
-        campgrounds = camps_res.data or []
+        # Check upcoming 7-day window starting tomorrow
+        for day_offset in range(1, 8):
+            check_in = (today + timedelta(days=day_offset)).isoformat()
+            check_out = (today + timedelta(days=day_offset + 1)).isoformat()
 
-        today = date.today()
-        for camp in campgrounds:
-            camp_id = str(camp.get("id") or camp.get("external_facility_id") or "")
-            ext_id = str(camp.get("external_facility_id") or camp_id)
-            country = str(camp.get("country") or "").upper()
+            is_open, _ = check_parks_canada_availability(map_id, check_in, check_out)
+            record_availability_to_db(name, short_id, check_in, is_open)
 
-            # Target Canadian campgrounds (by country field or `ca-` slug convention)
-            if country in ["CA", "CANADA"] or camp_id.startswith("ca-") or ext_id.startswith("ca-"):
-                # Ensure the next 7 days have valid, fresh rows in `campground_availability`
-                for day_offset in range(1, 8):
-                    target_date = (today + timedelta(days=day_offset)).isoformat()
-                    existing = (
-                        supabase.table("campground_availability")
-                        .select("id")
-                        .eq("campground_id", camp_id)
-                        .eq("availability_date", target_date)
-                        .limit(1)
-                        .execute()
-                    )
-                    if not existing.data:
-                        supabase.table("campground_availability").insert({
-                            "campground_id": camp_id,
-                            "unit_id": f"{camp_id}-site-1",
-                            "availability_date": target_date,
-                            "status": "Available",
-                            "timestamp_scraped": now_iso
-                        }).execute()
-
-        print("[+] 30-Min Broad Radar Calendar Sync complete.")
-    except Exception as e:
-        print(f"[!] Broad Radar Sync error: {e}")
+    print("[+] 30-Min Broad Radar Live Scrape complete.")
 
 
 def main():
     print("🚀 BasecampCheck 4-Tier Engine Online (Instant: 1m | Priority: 3m | Standard: 10m | Free: 30m)")
     while True:
-        run_broad_radar_sync()
         run_sniper_loop()
         process_notification_queue()
+        run_broad_radar_sync()
         time.sleep(30)
 
 
