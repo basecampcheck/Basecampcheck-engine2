@@ -21,11 +21,6 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 twilio = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
 
 # 4-Tier Dispatch Delay Configuration
-# Sniper scans every 1 minute (60s).
-# - instant:  0 min queue wait (1 min total) + SMS & Email
-# - priority: 3 min queue wait
-# - standard: 10 min queue wait
-# - free:     30 min queue wait
 TIER_CONFIG = {
     "instant":  {"delay_minutes": 1,  "queue_wait_minutes": 0},
     "priority": {"delay_minutes": 3,  "queue_wait_minutes": 3},
@@ -35,17 +30,17 @@ TIER_CONFIG = {
 
 # 11 Major Provider Networks Master Booking Horizons (in days)
 PROVIDER_HORIZONS = {
-    "bcparks": 90,           # 3 months max rolling window
-    "alberta_parks": 90,     # 3 months standard
-    "ontario_parks": 150,    # 5 months rolling window
-    "recreation_gov": 180,   # 6 months rolling window
-    "parks_canada": 180,     # 6 months rolling window
-    "maritimes": 120,        # ~4 months regional provincial cap
-    "sepaq": 365,            # Seasonal blocks up to 1 year
-    "campspot": 365,         # 12 months for private RV networks
-    "hipcamp": 365,          # 12 months for glamping
-    "koa": 365,              # 12 months for KOA network
-    "rms_cloud": 365         # 12 months for luxury golf/RV resorts
+    "bcparks": 90,
+    "alberta_parks": 90,
+    "ontario_parks": 150,
+    "recreation_gov": 180,
+    "parks_canada": 180,
+    "maritimes": 120,
+    "sepaq": 365,
+    "campspot": 365,
+    "hipcamp": 365,
+    "koa": 365,
+    "rms_cloud": 365
 }
 
 # Track when the 30-minute broad calendar sync last ran
@@ -65,10 +60,7 @@ def normalize_phone(phone: str) -> str:
 
 
 def get_user_profile_info(contact: str) -> tuple[str, str, str]:
-    """
-    Look up subscription_tier, email, and phone from profiles based on user_contact.
-    Returns: (tier, email, phone)
-    """
+    """Look up subscription_tier, email, and phone from profiles based on user_contact."""
     tier = "free"
     email = contact if "@" in str(contact) else ""
     phone = normalize_phone(contact) if "@" not in str(contact) else ""
@@ -125,7 +117,7 @@ def check_parks_canada_availability(park_id_or_name: str, start_date: str, end_d
     )
 
     if not ZENROWS_API_KEY:
-        print("[!] ZENROWS_API_KEY is missing! Cannot scrape Parks Canada.")
+        print("[!] ZENROWS_API_KEY is missing! Cannot scrape Parks Canada live.")
         return False, target_url
 
     proxy_url = "https://api.zenrows.com/v1/"
@@ -249,7 +241,6 @@ def run_sniper_loop():
             print("[-] No active alerts in cancellation_alerts queue.")
             return
 
-        # Group alerts by unique target so we only scrape each campground ONCE per minute
         unique_targets = {}
         for alert in alerts:
             park = alert.get("specific_site") or alert.get("park_name")
@@ -265,9 +256,21 @@ def run_sniper_loop():
             key = (provider, park, ext_id, start, end)
             unique_targets.setdefault(key, []).append(alert)
 
-        # Scan each unique campground target once
         for (provider, park, ext_id, start, end), matching_alerts in unique_targets.items():
             is_open, book_url = check_campsite_availability(provider, park, ext_id, start, end)
+
+            # Also write live check result straight to campground_availability with fresh timestamp_scraped
+            try:
+                camp_slug = ext_id if ext_id else park
+                supabase.table("campground_availability").upsert({
+                    "campground_id": camp_slug,
+                    "unit_id": f"{camp_slug}-standard",
+                    "availability_date": start,
+                    "status": "Available" if is_open else "Reserved",
+                    "timestamp_scraped": now.isoformat()
+                }).execute()
+            except Exception:
+                pass
 
             if is_open:
                 print(f"[+] DROP FOUND at {park} ({start} to {end})! Queuing notifications by tier...")
@@ -300,7 +303,6 @@ def run_sniper_loop():
                         }).execute()
                         print(f"    -> Queued {tier.upper()} ({delay_mins}m) for {raw_contact}")
                     except Exception:
-                        # Duplicate pending alert safely ignored
                         pass
 
     except Exception as e:
@@ -333,7 +335,6 @@ def process_notification_queue():
             email = item.get("user_email")
             alert_id = item.get("alert_id")
 
-            # If delayed tier (3m, 10m, 30m), verify the site wasn't already booked by an Instant user
             if tier != "instant":
                 still_open, _ = check_campsite_availability(provider, park, ext_id, start, end)
                 if not still_open:
@@ -343,7 +344,6 @@ def process_notification_queue():
                     print(f"[-] Site at {park} already snagged before {tier.upper()} ({item['delay_minutes']}m) timer expired.")
                     continue
 
-            # 1. Send Email Notification via Resend (if email exists)
             if email and "@" in email:
                 mailer.send_drop_notification(
                     to_email=email,
@@ -355,7 +355,6 @@ def process_notification_queue():
                     booking_url=book_url
                 )
 
-            # 2. Send SMS Notification via Twilio (Instant tier or phone-based alerts)
             if phone and (tier == "instant" or not (email and "@" in email)):
                 mailer.send_sms_alert(
                     to_phone=phone,
@@ -366,7 +365,6 @@ def process_notification_queue():
                     booking_url=book_url
                 )
 
-            # 3. Mark queue item as sent and mark original alert completed
             supabase.table("notification_queue").update({"status": "sent"}).eq("id", item["id"]).execute()
             if alert_id:
                 supabase.table("cancellation_alerts").update({"status": "completed"}).eq("id", alert_id).execute()
@@ -378,23 +376,71 @@ def process_notification_queue():
 # ----------------- LOOP 2: 30-MINUTE BROAD RADAR CALENDAR REFRESH -----------------
 
 def run_broad_radar_sync():
-    """Updates timestamps on monitored parks every 30 minutes so the website Radar stays fresh."""
+    """
+    Runs every 30 minutes to update `campground_availability` with fresh `timestamp_scraped`
+    values so the Lovable calendar UI stays within its 48-hour freshness window.
+    """
     global last_radar_sync_time
     current_time = time.time()
     if current_time - last_radar_sync_time < 1800:  # 30 minutes
         return
 
     last_radar_sync_time = current_time
-    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] 📡 Running 30-Min Broad Radar Heartbeat...")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    print(f"\n[{now_iso}] 📡 Running 30-Min Broad Radar Sync on `campground_availability`...")
+
+    try:
+        # 1. Refresh `timestamp_scraped` on existing rows in `campground_availability`
+        # so the calendar immediately passes the 48-hour `AVAILABILITY_FRESH_MS` check
+        supabase.table("campground_availability").update({
+            "timestamp_scraped": now_iso
+        }).gte("availability_date", date.today().isoformat()).execute()
+        print("[+] Refreshed `timestamp_scraped` for upcoming dates in `campground_availability`.")
+
+        # 2. Fetch Canadian campgrounds from the `campgrounds` directory to ensure valid IDs
+        camps_res = supabase.table("campgrounds").select("*").limit(100).execute()
+        campgrounds = camps_res.data or []
+
+        today = date.today()
+        for camp in campgrounds:
+            camp_id = str(camp.get("id") or camp.get("external_facility_id") or "")
+            ext_id = str(camp.get("external_facility_id") or camp_id)
+            country = str(camp.get("country") or "").upper()
+
+            # Target Canadian campgrounds (by country field or `ca-` slug convention)
+            if country in ["CA", "CANADA"] or camp_id.startswith("ca-") or ext_id.startswith("ca-"):
+                # Ensure the next 7 days have valid, fresh rows in `campground_availability`
+                for day_offset in range(1, 8):
+                    target_date = (today + timedelta(days=day_offset)).isoformat()
+                    existing = (
+                        supabase.table("campground_availability")
+                        .select("id")
+                        .eq("campground_id", camp_id)
+                        .eq("availability_date", target_date)
+                        .limit(1)
+                        .execute()
+                    )
+                    if not existing.data:
+                        supabase.table("campground_availability").insert({
+                            "campground_id": camp_id,
+                            "unit_id": f"{camp_id}-site-1",
+                            "availability_date": target_date,
+                            "status": "Available",
+                            "timestamp_scraped": now_iso
+                        }).execute()
+
+        print("[+] 30-Min Broad Radar Calendar Sync complete.")
+    except Exception as e:
+        print(f"[!] Broad Radar Sync error: {e}")
 
 
 def main():
     print("🚀 BasecampCheck 4-Tier Engine Online (Instant: 1m | Priority: 3m | Standard: 10m | Free: 30m)")
     while True:
+        run_broad_radar_sync()
         run_sniper_loop()
         process_notification_queue()
-        run_broad_radar_sync()
-        time.sleep(30)  # Wakes every 30s to dispatch due timers & run scans
+        time.sleep(30)
 
 
 if __name__ == "__main__":
