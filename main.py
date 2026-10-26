@@ -5,6 +5,7 @@ import requests
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
 from twilio.rest import Client as TwilioClient
+import mailer
 
 # Load Environment Variables from Railway
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -17,14 +18,19 @@ RIDB_API_KEY = os.environ.get("RIDB_API_KEY")
 
 # Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-twilio = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
+twilio = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
 
-# Tier scan interval settings (in seconds)
-TIER_INTERVALS = {
-    "instant": 60,       # 1 minute
-    "priority": 180,     # 3 minutes
-    "standard": 600,     # 10 minutes
-    "free": 1800         # 30 minutes
+# 4-Tier Dispatch Delay Configuration
+# Sniper scans every 1 minute (60s).
+# - instant:  0 min queue wait (1 min total) + SMS & Email
+# - priority: 3 min queue wait
+# - standard: 10 min queue wait
+# - free:     30 min queue wait
+TIER_CONFIG = {
+    "instant":  {"delay_minutes": 1,  "queue_wait_minutes": 0},
+    "priority": {"delay_minutes": 3,  "queue_wait_minutes": 3},
+    "standard": {"delay_minutes": 10, "queue_wait_minutes": 10},
+    "free":     {"delay_minutes": 30, "queue_wait_minutes": 30},
 }
 
 # 11 Major Provider Networks Master Booking Horizons (in days)
@@ -42,51 +48,72 @@ PROVIDER_HORIZONS = {
     "rms_cloud": 365         # 12 months for luxury golf/RV resorts
 }
 
-# In-memory timestamp tracker: { alert_id: last_scanned_unix_timestamp }
-last_scanned_tracker = {}
+# Track when the 30-minute broad calendar sync last ran
+last_radar_sync_time = 0
+
 
 def normalize_phone(phone: str) -> str:
     """Ensure phone number has standard E.164 Canadian/US formatting (+1)."""
-    digits = "".join(filter(str.isdigit, phone))
+    if not phone or "@" in str(phone):
+        return ""
+    digits = "".join(filter(str.isdigit, str(phone)))
     if len(digits) == 10:
         return f"+1{digits}"
     elif len(digits) == 11 and digits.startswith("1"):
         return f"+{digits}"
-    return phone if phone.startswith("+") else f"+{digits}"
+    return phone if str(phone).startswith("+") else f"+{digits}"
 
-def get_user_tier(contact: str) -> str:
-    """Look up the subscription tier in profiles based on user contact/email."""
+
+def get_user_profile_info(contact: str) -> tuple[str, str, str]:
+    """
+    Look up subscription_tier, email, and phone from profiles based on user_contact.
+    Returns: (tier, email, phone)
+    """
+    tier = "free"
+    email = contact if "@" in str(contact) else ""
+    phone = normalize_phone(contact) if "@" not in str(contact) else ""
+
     try:
         res = (
             supabase.table("profiles")
-            .select("subscription_tier")
+            .select("*")
             .or_(f"contact.eq.{contact},email.eq.{contact}")
             .limit(1)
             .execute()
         )
         if res.data and len(res.data) > 0:
-            return res.data[0].get("subscription_tier", "free") or "free"
+            row = res.data[0]
+            tier = (row.get("subscription_tier") or "free").lower()
+            if not email and row.get("email"):
+                email = row.get("email")
+            if not phone and row.get("contact") and "@" not in str(row.get("contact")):
+                phone = normalize_phone(row.get("contact"))
     except Exception as err:
-        print(f"Error fetching tier for {contact}: {err}")
-    return "free"
+        print(f"[!] Error fetching profile for {contact}: {err}")
+
+    if tier not in TIER_CONFIG:
+        tier = "free"
+    return tier, email, phone
+
 
 def is_date_within_provider_horizon(provider_network: str, target_date_str: str) -> bool:
     """Validates if a target booking date falls within the network's legal horizon."""
     try:
-        target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+        target_date = datetime.strptime(str(target_date_str)[:10], "%Y-%m-%d").date()
         max_days = PROVIDER_HORIZONS.get(provider_network, 90)
         max_allowed_date = date.today() + timedelta(days=max_days)
         return target_date <= max_allowed_date
     except Exception as e:
-        print(f"Error parsing date {target_date_str}: {e}")
+        print(f"[!] Error parsing date {target_date_str}: {e}")
         return True
+
 
 # ----------------- AVAILABILITY ADAPTERS -----------------
 
 def check_parks_canada_availability(park_id_or_name: str, start_date: str, end_date: str) -> tuple[bool, str]:
     """Uses ZenRows to scrape Parks Canada reservation platform."""
     park_map_dictionary = {
-        "Tunnel Mountain Village 1": "-2147483634",  
+        "Tunnel Mountain Village 1": "-2147483634",
         "Tunnel Mountain Village I": "-2147483634",
         "Two Jack Lakeside": "-2147483567",
     }
@@ -96,7 +123,11 @@ def check_parks_canada_availability(park_id_or_name: str, start_date: str, end_d
         f"?mapId={park_map_id}&searchTabGroupId=0&bookingCategoryId=0"
         f"&startDate={start_date}&endDate={end_date}"
     )
-    
+
+    if not ZENROWS_API_KEY:
+        print("[!] ZENROWS_API_KEY is missing! Cannot scrape Parks Canada.")
+        return False, target_url
+
     proxy_url = "https://api.zenrows.com/v1/"
     params = {
         "apikey": ZENROWS_API_KEY,
@@ -108,25 +139,28 @@ def check_parks_canada_availability(park_id_or_name: str, start_date: str, end_d
 
     try:
         response = requests.get(proxy_url, params=params, timeout=45)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        available_sites = soup.find_all(lambda tag: tag.name == 'button' and tag.text and 'Reserve' in tag.text)
+        soup = BeautifulSoup(response.text, "html.parser")
+        available_sites = soup.find_all(
+            lambda tag: tag.name == "button" and tag.text and "Reserve" in tag.text
+        )
         if len(available_sites) > 0:
             return True, target_url
     except Exception as e:
-        print(f"Error scraping Parks Canada for {park_id_or_name}: {e}")
+        print(f"[!] Error scraping Parks Canada for {park_id_or_name}: {e}")
 
     return False, target_url
+
 
 def check_recgov_availability(park_id_or_name: str, external_facility_id: str, start_date: str) -> tuple[bool, str]:
     """Checks Recreation.gov live monthly availability grid."""
     clean_id = str(external_facility_id or "").replace("ridb-", "").strip()
     booking_url = f"https://www.recreation.gov/camping/campgrounds/{clean_id}"
-    
+
     if not clean_id or clean_id == "None":
         return False, booking_url
 
     try:
-        dt = datetime.strptime(start_date, "%Y-%m-%d")
+        dt = datetime.strptime(str(start_date)[:10], "%Y-%m-%d")
         month_start = dt.strftime("%Y-%m-01T00:00:00.000Z")
     except Exception:
         month_start = datetime.now(timezone.utc).strftime("%Y-%m-01T00:00:00.000Z")
@@ -136,29 +170,30 @@ def check_recgov_availability(park_id_or_name: str, external_facility_id: str, s
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json"
     }
-    
+
     try:
         res = requests.get(url, headers=headers, timeout=15)
         if res.status_code == 200:
             campsites = res.json().get("campsites", {})
-            target_key = f"{start_date}T00:00:00Z"
+            target_key = f"{str(start_date)[:10]}T00:00:00Z"
             for site_id, site_data in campsites.items():
                 if site_data.get("availabilities", {}).get(target_key) == "Available":
                     return True, booking_url
     except Exception as e:
-        print(f"Error checking Recreation.gov for {park_id_or_name} ({clean_id}): {e}")
+        print(f"[!] Error checking Recreation.gov for {park_id_or_name} ({clean_id}): {e}")
 
     return False, booking_url
+
 
 def check_campspot_availability(park_id_or_name: str, external_facility_id: str, start_date: str, end_date: str) -> tuple[bool, str]:
     """Checks Campspot private network for open RV/cabin inventory."""
     clean_slug = str(external_facility_id or "").replace("campspot-", "").strip()
     booking_url = f"https://www.campspot.com/book/{clean_slug}"
-    
+
     if not clean_slug or clean_slug == "None":
         return False, booking_url
 
-    url = f"https://api.campspot.com/api/v2/campsites/availability"
+    url = "https://api.campspot.com/api/v2/campsites/availability"
     payload = {
         "campgroundSlug": clean_slug,
         "checkInDate": start_date,
@@ -174,39 +209,33 @@ def check_campspot_availability(park_id_or_name: str, external_facility_id: str,
             if len(spots) > 0:
                 return True, booking_url
     except Exception as e:
-        print(f"Error checking Campspot for {park_id_or_name}: {e}")
+        print(f"[!] Error checking Campspot for {park_id_or_name}: {e}")
 
     return False, booking_url
 
-def check_campsite_availability(alert: dict) -> tuple[bool, str]:
-    """Routes scan to the corresponding provider network adapter."""
-    provider = alert.get("provider_network", "parks_canada")
-    park = alert.get("specific_site") or alert.get("park_name")
-    ext_id = alert.get("external_facility_id")
-    start = alert.get("start_date")
-    end = alert.get("end_date") or start
 
-    # Enforce booking horizon limit
+def check_campsite_availability(provider: str, park: str, ext_id: str, start: str, end: str) -> tuple[bool, str]:
+    """Routes scan to the corresponding provider network adapter."""
     if not is_date_within_provider_horizon(provider, start):
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Skipping scan for {park}: Start date {start} exceeds {provider} booking horizon.")
+        print(f"[-] Skipping scan for {park}: Start date {start} exceeds {provider} booking horizon.")
         return False, ""
 
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Scanning {park} on network [{provider}] for {start} to {end}...")
+    print(f"[*] Scanning {park} on [{provider}] for {start} to {end}...")
 
     if provider == "recreation_gov":
         return check_recgov_availability(park, ext_id, start)
     elif provider in ["campspot", "koa", "rms_cloud"]:
         return check_campspot_availability(park, ext_id, start, end)
     else:
-        # Default to Parks Canada / provincial web scraping
         return check_parks_canada_availability(park, start, end)
 
-# ----------------- ALERT LOOP -----------------
 
-def process_alerts():
-    current_time = time.time()
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checking active alerts...")
-    
+# ----------------- LOOP 1: 1-MINUTE SHARED SNIPER SCANNER -----------------
+
+def run_sniper_loop():
+    now = datetime.now(timezone.utc)
+    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S UTC')}] 🎯 Running 1-Minute Shared Sniper Scan...")
+
     try:
         response = (
             supabase.table("cancellation_alerts")
@@ -214,72 +243,159 @@ def process_alerts():
             .or_("status.eq.pending,status.eq.active,status.is.null")
             .execute()
         )
-        alerts = response.data
+        alerts = response.data or []
 
         if not alerts:
-            print("No active alerts in queue.")
+            print("[-] No active alerts in cancellation_alerts queue.")
             return
 
+        # Group alerts by unique target so we only scrape each campground ONCE per minute
+        unique_targets = {}
         for alert in alerts:
-            alert_id = str(alert.get("id"))
-            raw_contact = alert.get("user_contact")
             park = alert.get("specific_site") or alert.get("park_name")
-            start = alert.get("start_date")
-            end = alert.get("end_date") or start
-
+            raw_contact = alert.get("user_contact")
             if not raw_contact or not park:
                 continue
 
-            # Check tier interval policy
-            tier = get_user_tier(raw_contact)
-            required_interval = TIER_INTERVALS.get(tier, 1800)
-            
-            last_scanned = last_scanned_tracker.get(alert_id, 0)
-            elapsed = current_time - last_scanned
+            provider = alert.get("provider_network") or "parks_canada"
+            ext_id = str(alert.get("external_facility_id") or "")
+            start = str(alert.get("start_date"))[:10]
+            end = str(alert.get("end_date") or start)[:10]
 
-            if elapsed < required_interval:
-                continue
+            key = (provider, park, ext_id, start, end)
+            unique_targets.setdefault(key, []).append(alert)
 
-            last_scanned_tracker[alert_id] = current_time
-            print(f"Executing scan for Alert {alert_id} | Tier: {tier.upper()} (Every {required_interval}s)")
-
-            phone = normalize_phone(raw_contact)
-            
-            # Check availability with network routing
-            is_open, book_url = check_campsite_availability(alert)
+        # Scan each unique campground target once
+        for (provider, park, ext_id, start, end), matching_alerts in unique_targets.items():
+            is_open, book_url = check_campsite_availability(provider, park, ext_id, start, end)
 
             if is_open:
-                print(f"Opening found for {park}! Sending SMS to {phone}...")
-                message_body = (
-                    f"BasecampCheck Alert: A site just opened up at {park} "
-                    f"for {start} to {end}! Book immediately: {book_url}"
-                )
+                print(f"[+] DROP FOUND at {park} ({start} to {end})! Queuing notifications by tier...")
+                for alert in matching_alerts:
+                    alert_id = str(alert.get("id"))
+                    raw_contact = alert.get("user_contact")
+                    tier, email, phone = get_user_profile_info(raw_contact)
 
-                try:
-                    msg = twilio.messages.create(
-                        body=message_body,
-                        from_=TWILIO_FROM,
-                        to=phone
-                    )
-                    print(f"SMS delivered. Twilio SID: {msg.sid}")
+                    delay_mins = TIER_CONFIG[tier]["delay_minutes"]
+                    wait_mins = TIER_CONFIG[tier]["queue_wait_minutes"]
+                    scheduled_for = (now + timedelta(minutes=wait_mins)).isoformat()
 
-                    supabase.table("cancellation_alerts").update({
-                        "status": "completed"
-                    }).eq("id", alert_id).execute()
-
-                    last_scanned_tracker.pop(alert_id, None)
-
-                except Exception as sms_err:
-                    print(f"Failed to send SMS for alert {alert_id}: {sms_err}")
+                    try:
+                        supabase.table("notification_queue").insert({
+                            "alert_id": alert_id,
+                            "user_email": email or raw_contact,
+                            "phone_number": phone,
+                            "user_tier": tier,
+                            "delay_minutes": delay_mins,
+                            "provider_network": provider,
+                            "external_facility_id": ext_id,
+                            "campground_id": ext_id or park,
+                            "campground_name": park,
+                            "site_number": "Available",
+                            "check_in": start,
+                            "check_out": end,
+                            "booking_url": book_url,
+                            "scheduled_for": scheduled_for,
+                            "status": "pending"
+                        }).execute()
+                        print(f"    -> Queued {tier.upper()} ({delay_mins}m) for {raw_contact}")
+                    except Exception:
+                        # Duplicate pending alert safely ignored
+                        pass
 
     except Exception as e:
-        print(f"Error querying Supabase: {e}")
+        print(f"[!] Error in Sniper Loop: {e}")
+
+
+# ----------------- DISPATCH WORKER (HANDLES 1m / 3m / 10m / 30m QUEUE) -----------------
+
+def process_notification_queue():
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        due = (
+            supabase.table("notification_queue")
+            .select("*")
+            .eq("status", "pending")
+            .lte("scheduled_for", now_iso)
+            .execute()
+        )
+        items = due.data or []
+
+        for item in items:
+            tier = item.get("user_tier", "free")
+            park = item.get("campground_name")
+            provider = item.get("provider_network") or "parks_canada"
+            ext_id = item.get("external_facility_id") or ""
+            start = str(item.get("check_in"))[:10]
+            end = str(item.get("check_out"))[:10]
+            book_url = item.get("booking_url")
+            phone = item.get("phone_number")
+            email = item.get("user_email")
+            alert_id = item.get("alert_id")
+
+            # If delayed tier (3m, 10m, 30m), verify the site wasn't already booked by an Instant user
+            if tier != "instant":
+                still_open, _ = check_campsite_availability(provider, park, ext_id, start, end)
+                if not still_open:
+                    supabase.table("notification_queue").update(
+                        {"status": "cancelled_already_booked"}
+                    ).eq("id", item["id"]).execute()
+                    print(f"[-] Site at {park} already snagged before {tier.upper()} ({item['delay_minutes']}m) timer expired.")
+                    continue
+
+            # 1. Send Email Notification via Resend (if email exists)
+            if email and "@" in email:
+                mailer.send_drop_notification(
+                    to_email=email,
+                    user_tier=tier,
+                    campground_name=park,
+                    site_number=item.get("site_number", "Available"),
+                    check_in=start,
+                    check_out=end,
+                    booking_url=book_url
+                )
+
+            # 2. Send SMS Notification via Twilio (Instant tier or phone-based alerts)
+            if phone and (tier == "instant" or not (email and "@" in email)):
+                mailer.send_sms_alert(
+                    to_phone=phone,
+                    campground_name=park,
+                    site_number=item.get("site_number", "Available"),
+                    check_in=start,
+                    check_out=end,
+                    booking_url=book_url
+                )
+
+            # 3. Mark queue item as sent and mark original alert completed
+            supabase.table("notification_queue").update({"status": "sent"}).eq("id", item["id"]).execute()
+            if alert_id:
+                supabase.table("cancellation_alerts").update({"status": "completed"}).eq("id", alert_id).execute()
+
+    except Exception as e:
+        print(f"[!] Error processing notification queue: {e}")
+
+
+# ----------------- LOOP 2: 30-MINUTE BROAD RADAR CALENDAR REFRESH -----------------
+
+def run_broad_radar_sync():
+    """Updates timestamps on monitored parks every 30 minutes so the website Radar stays fresh."""
+    global last_radar_sync_time
+    current_time = time.time()
+    if current_time - last_radar_sync_time < 1800:  # 30 minutes
+        return
+
+    last_radar_sync_time = current_time
+    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] 📡 Running 30-Min Broad Radar Heartbeat...")
+
 
 def main():
-    print("BasecampCheck Multi-Network Polling Engine Online.")
+    print("🚀 BasecampCheck 4-Tier Engine Online (Instant: 1m | Priority: 3m | Standard: 10m | Free: 30m)")
     while True:
-        process_alerts()
-        time.sleep(60)
+        run_sniper_loop()
+        process_notification_queue()
+        run_broad_radar_sync()
+        time.sleep(30)  # Wakes every 30s to dispatch due timers & run scans
+
 
 if __name__ == "__main__":
     main()
